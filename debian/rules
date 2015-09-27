@@ -1,0 +1,9 @@
+#!/usr/bin/make -f
+%:
+	dh $@ --with python-virtualenv 
+
+clean:
+	git clean -fxd
+
+override_dh_auto_test:
+	@true

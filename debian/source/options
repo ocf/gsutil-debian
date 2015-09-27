@@ -1,0 +1,3 @@
+extend-diff-ignore = "^third_party/"
+extend-diff-ignore = "^.pybuild"
+extend-diff-ignore = "^build/"

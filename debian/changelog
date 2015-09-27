@@ -1,0 +1,5 @@
+google-gsutil (4.15-1~ocf1) unstable; urgency=medium
+
+  * Initial release.
+
+ -- Chris Kuehl <ckuehl@ocf.berkeley.edu>  Sun, 27 Sep 2015 11:21:44 -0700
