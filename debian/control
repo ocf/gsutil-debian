@@ -2,7 +2,14 @@ Source: google-gsutil
 Section: python
 Priority: extra
 Maintainer: Open Computing Facility <help@ocf.berkeley.edu>
-Build-Depends: debhelper (>= 9), python, dh-virtualenv
+Build-Depends: debhelper (>= 9),
+               dh-virtualenv,
+               git,
+               libffi-dev,
+               libssl-dev,
+               python,
+               python-setuptools,
+               python-dev
 Standards-Version: 3.9.6
 X-Python-Version: 2.7
 

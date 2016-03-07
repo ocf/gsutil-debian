@@ -3,7 +3,7 @@
 	dh $@ --with python-virtualenv 
 
 clean:
-	git clean -fxd
+	if [ -d .git ]; then git clean -fxd; fi
 
 override_dh_auto_test:
 	@true
