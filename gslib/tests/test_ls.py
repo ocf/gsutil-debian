@@ -26,6 +26,30 @@ from gslib.cs_api_map import ApiSelector
 import gslib.tests.testcase as testcase
 from gslib.tests.testcase.integration_testcase import SkipForS3
 from gslib.tests.util import ObjectToURI as suri
+from gslib.tests.util import SetBotoConfigForTest
+from gslib.tests.util import TEST_ENCRYPTION_CONTENT1
+from gslib.tests.util import TEST_ENCRYPTION_CONTENT1_CRC32C
+from gslib.tests.util import TEST_ENCRYPTION_CONTENT1_MD5
+from gslib.tests.util import TEST_ENCRYPTION_CONTENT2
+from gslib.tests.util import TEST_ENCRYPTION_CONTENT2_CRC32C
+from gslib.tests.util import TEST_ENCRYPTION_CONTENT2_MD5
+from gslib.tests.util import TEST_ENCRYPTION_CONTENT3
+from gslib.tests.util import TEST_ENCRYPTION_CONTENT3_CRC32C
+from gslib.tests.util import TEST_ENCRYPTION_CONTENT3_MD5
+from gslib.tests.util import TEST_ENCRYPTION_CONTENT4
+from gslib.tests.util import TEST_ENCRYPTION_CONTENT4_CRC32C
+from gslib.tests.util import TEST_ENCRYPTION_CONTENT4_MD5
+from gslib.tests.util import TEST_ENCRYPTION_CONTENT5
+from gslib.tests.util import TEST_ENCRYPTION_CONTENT5_CRC32C
+from gslib.tests.util import TEST_ENCRYPTION_CONTENT5_MD5
+from gslib.tests.util import TEST_ENCRYPTION_KEY1
+from gslib.tests.util import TEST_ENCRYPTION_KEY1_SHA256_B64
+from gslib.tests.util import TEST_ENCRYPTION_KEY2
+from gslib.tests.util import TEST_ENCRYPTION_KEY2_SHA256_B64
+from gslib.tests.util import TEST_ENCRYPTION_KEY3
+from gslib.tests.util import TEST_ENCRYPTION_KEY3_SHA256_B64
+from gslib.tests.util import TEST_ENCRYPTION_KEY4
+from gslib.tests.util import TEST_ENCRYPTION_KEY4_SHA256_B64
 from gslib.tests.util import unittest
 from gslib.util import IS_WINDOWS
 from gslib.util import Retry
@@ -150,6 +174,32 @@ class TestLs(testcase.GsUtilIntegrationTestCase):
       stdout = self.RunGsUtil(['ls', '%s/dir' % suri(bucket_uri)],
                               return_stdout=True)
       self.assertEqual('%s\n' % suri(k2_uri), stdout)
+      stdout = self.RunGsUtil(['ls', suri(k1_uri)], return_stdout=True)
+      self.assertEqual('%s\n' % suri(k1_uri), stdout)
+    _Check1()
+
+  def test_subdir_nocontents(self):
+    """Tests listing a bucket subdirectory using -d.
+
+    Result will display subdirectory names instead of contents. Uses a wildcard
+    to show multiple matching subdirectories.
+    """
+    bucket_uri = self.CreateBucket(test_objects=1)
+    k1_uri = bucket_uri.clone_replace_name('foo')
+    k1_uri.set_contents_from_string('baz')
+    k2_uri = bucket_uri.clone_replace_name('dir/foo')
+    k2_uri.set_contents_from_string('bar')
+    k3_uri = bucket_uri.clone_replace_name('dir/foo2')
+    k3_uri.set_contents_from_string('foo')
+    k4_uri = bucket_uri.clone_replace_name('dir2/foo3')
+    k4_uri.set_contents_from_string('foo2')
+    # Use @Retry as hedge against bucket listing eventual consistency.
+    @Retry(AssertionError, tries=3, timeout_secs=1)
+    def _Check1():
+      stdout = self.RunGsUtil(['ls', '-d', '%s/dir*' % suri(bucket_uri)],
+                              return_stdout=True)
+      self.assertEqual('%s/dir/\n%s/dir2/\n' %
+                       (suri(bucket_uri), suri(bucket_uri)), stdout)
       stdout = self.RunGsUtil(['ls', suri(k1_uri)], return_stdout=True)
       self.assertEqual('%s\n' % suri(k1_uri), stdout)
     _Check1()
@@ -368,6 +418,13 @@ class TestLs(testcase.GsUtilIntegrationTestCase):
       self.assertIn(key_uri.version_id, stdout)
       self.assertIn(key_uri.get_key().etag.strip('"\''), stdout)
 
+  def test_list_acl(self):
+    """Tests that long listing includes an ACL."""
+    key_uri = self.CreateObject(contents='foo')
+    stdout = self.RunGsUtil(['ls', '-L', suri(key_uri)], return_stdout=True)
+    self.assertIn('ACL:', stdout)
+    self.assertNotIn('ACCESS DENIED', stdout)
+
   def test_list_gzip_content_length(self):
     """Tests listing a gzipped object."""
     file_size = 10000
@@ -424,6 +481,30 @@ class TestLs(testcase.GsUtilIntegrationTestCase):
     # removed.
     self.assertIn(suri(bucket_uri) + '//', stdout)
 
+  def test_wildcard_prefix(self):
+    """Tests that an object name with a wildcard does not infinite loop."""
+    bucket_uri = self.CreateBucket()
+    wildcard_folder_object = 'wildcard*/'
+    object_matching_folder = 'wildcard10/foo'
+    self.CreateObject(bucket_uri=bucket_uri, object_name=wildcard_folder_object,
+                      contents='foo')
+    self.CreateObject(bucket_uri=bucket_uri, object_name=object_matching_folder,
+                      contents='foo')
+    self.AssertNObjectsInBucket(bucket_uri, 2)
+    stderr = self.RunGsUtil(['ls', suri(bucket_uri, 'wildcard*')],
+                            return_stderr=True, expected_status=1)
+    self.assertIn('Cloud folder %s%s contains a wildcard' %
+                  (suri(bucket_uri), '/wildcard*/'), stderr)
+
+    # Listing with a flat wildcard should still succeed.
+    # Use @Retry as hedge against bucket listing eventual consistency.
+    @Retry(AssertionError, tries=3, timeout_secs=1)
+    def _Check():
+      stdout = self.RunGsUtil(['ls', '-l', suri(bucket_uri, '**')],
+                              return_stdout=True)
+      self.assertNumLines(stdout, 3)  # 2 object lines, one summary line.
+    _Check()
+
   @SkipForS3('S3 anonymous access is not supported.')
   def test_get_object_without_list_bucket_permission(self):
     # Bucket is not publicly readable by default.
@@ -437,3 +518,95 @@ class TestLs(testcase.GsUtilIntegrationTestCase):
       stdout = self.RunGsUtil(['ls', '-L', suri(object_uri)],
                               return_stdout=True)
       self.assertIn(suri(object_uri), stdout)
+
+  @SkipForS3('S3 customer-supplied encryption keys are not supported.')
+  def test_list_encrypted_object(self):
+    if self.test_api == ApiSelector.XML:
+      return unittest.skip(
+          'gsutil does not support encryption with the XML API')
+    object_uri = self.CreateObject(object_name='foo',
+                                   contents=TEST_ENCRYPTION_CONTENT1,
+                                   encryption_key=TEST_ENCRYPTION_KEY1)
+
+    # Listing object with key should return unencrypted hashes.
+    with SetBotoConfigForTest([
+        ('GSUtil', 'encryption_key', TEST_ENCRYPTION_KEY1)]):
+      # Use @Retry as hedge against bucket listing eventual consistency.
+      @Retry(AssertionError, tries=3, timeout_secs=1)
+      def _ListExpectDecrypted():
+        stdout = self.RunGsUtil(['ls', '-L', suri(object_uri)],
+                                return_stdout=True)
+        self.assertIn(TEST_ENCRYPTION_CONTENT1_MD5, stdout)
+        self.assertIn(TEST_ENCRYPTION_CONTENT1_CRC32C, stdout)
+        self.assertIn(TEST_ENCRYPTION_KEY1_SHA256_B64, stdout)
+      _ListExpectDecrypted()
+
+    # Listing object without a key should return encrypted hashes.
+    # Use @Retry as hedge against bucket listing eventual consistency.
+    @Retry(AssertionError, tries=3, timeout_secs=1)
+    def _ListExpectEncrypted():
+      stdout = self.RunGsUtil(['ls', '-L', suri(object_uri)],
+                              return_stdout=True)
+      self.assertNotIn(TEST_ENCRYPTION_CONTENT1_MD5, stdout)
+      self.assertNotIn(TEST_ENCRYPTION_CONTENT1_CRC32C, stdout)
+      self.assertIn('encrypted', stdout)
+      self.assertIn(TEST_ENCRYPTION_KEY1_SHA256_B64, stdout)
+    _ListExpectEncrypted()
+
+    # Listing object with a non-matching key should return encrypted hashes.
+    with SetBotoConfigForTest([
+        ('GSUtil', 'encryption_key', TEST_ENCRYPTION_KEY2)]):
+      _ListExpectEncrypted()
+
+  @SkipForS3('S3 customer-supplied encryption keys are not supported.')
+  def test_list_mixed_encryption(self):
+    """Tests listing objects with various encryption interactions."""
+    bucket_uri = self.CreateBucket()
+
+    self.CreateObject(
+        bucket_uri=bucket_uri, object_name='foo',
+        contents=TEST_ENCRYPTION_CONTENT1, encryption_key=TEST_ENCRYPTION_KEY1)
+    self.CreateObject(
+        bucket_uri=bucket_uri, object_name='foo2',
+        contents=TEST_ENCRYPTION_CONTENT2, encryption_key=TEST_ENCRYPTION_KEY2)
+    self.CreateObject(
+        bucket_uri=bucket_uri, object_name='foo3',
+        contents=TEST_ENCRYPTION_CONTENT3, encryption_key=TEST_ENCRYPTION_KEY3)
+    self.CreateObject(
+        bucket_uri=bucket_uri, object_name='foo4',
+        contents=TEST_ENCRYPTION_CONTENT4, encryption_key=TEST_ENCRYPTION_KEY4)
+    self.CreateObject(
+        bucket_uri=bucket_uri, object_name='foo5',
+        contents=TEST_ENCRYPTION_CONTENT5)
+
+    # List 5 objects, one encrypted with each of four keys, and one
+    # unencrypted. Supplying keys [1,3,4] should result in four unencrypted
+    # listings and one encrypted listing (for key 2).
+    with SetBotoConfigForTest([
+        ('GSUtil', 'encryption_key', TEST_ENCRYPTION_KEY1),
+        ('GSUtil', 'decryption_key1', TEST_ENCRYPTION_KEY3),
+        ('GSUtil', 'decryption_key2', TEST_ENCRYPTION_KEY4)
+        ]):
+      # Use @Retry as hedge against bucket listing eventual consistency.
+      @Retry(AssertionError, tries=3, timeout_secs=1)
+      def _ListExpectMixed():
+        """Validates object listing."""
+        stdout = self.RunGsUtil(['ls', '-L', suri(bucket_uri)],
+                                return_stdout=True)
+        self.assertIn(TEST_ENCRYPTION_CONTENT1_MD5, stdout)
+        self.assertIn(TEST_ENCRYPTION_CONTENT1_CRC32C, stdout)
+        self.assertIn(TEST_ENCRYPTION_KEY1_SHA256_B64, stdout)
+        self.assertNotIn(TEST_ENCRYPTION_CONTENT2_MD5, stdout)
+        self.assertNotIn(TEST_ENCRYPTION_CONTENT2_CRC32C, stdout)
+        self.assertIn('encrypted', stdout)
+        self.assertIn(TEST_ENCRYPTION_KEY2_SHA256_B64, stdout)
+        self.assertIn(TEST_ENCRYPTION_CONTENT3_MD5, stdout)
+        self.assertIn(TEST_ENCRYPTION_CONTENT3_CRC32C, stdout)
+        self.assertIn(TEST_ENCRYPTION_KEY3_SHA256_B64, stdout)
+        self.assertIn(TEST_ENCRYPTION_CONTENT4_MD5, stdout)
+        self.assertIn(TEST_ENCRYPTION_CONTENT4_CRC32C, stdout)
+        self.assertIn(TEST_ENCRYPTION_KEY4_SHA256_B64, stdout)
+        self.assertIn(TEST_ENCRYPTION_CONTENT5_MD5, stdout)
+        self.assertIn(TEST_ENCRYPTION_CONTENT5_CRC32C, stdout)
+
+      _ListExpectMixed()

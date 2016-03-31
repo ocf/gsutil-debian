@@ -31,6 +31,8 @@ from boto.s3.deletemarker import DeleteMarker
 from boto.storage_uri import BucketStorageUri
 
 import gslib
+from gslib.cloud_api import CryptoTuple
+from gslib.encryption_helper import Base64Sha256FromBase64EncryptionKey
 from gslib.gcs_json_api import GcsJsonApi
 from gslib.hashing_helper import Base64ToHexHash
 from gslib.project_id import GOOG_PROJ_ID_HDR
@@ -39,7 +41,6 @@ from gslib.tests.testcase import base
 import gslib.tests.util as util
 from gslib.tests.util import ObjectToURI as suri
 from gslib.tests.util import RUN_S3_TESTS
-from gslib.tests.util import SetBotoConfigFileForTest
 from gslib.tests.util import SetBotoConfigForTest
 from gslib.tests.util import SetEnvironmentForTest
 from gslib.tests.util import unittest
@@ -50,17 +51,6 @@ from gslib.util import UTF8
 
 
 LOGGER = logging.getLogger('integration-test')
-
-# Contents of boto config file that will tell gsutil not to override the real
-# error message with a warning about anonymous access if no credentials are
-# provided in the config file. Also, because we retry 401s, reduce the number
-# of retries so we don't go through a long exponential backoff in tests.
-BOTO_CONFIG_CONTENTS_IGNORE_ANON_WARNING = """
-[Boto]
-num_retries = 2
-[Tests]
-bypass_anonymous_access_warning = True
-"""
 
 
 def SkipForGS(reason):
@@ -193,6 +183,20 @@ class GsUtilIntegrationTestCase(base.GsUtilTestCase):
       return listing
     return _Check1()
 
+  def AssertObjectUsesEncryptionKey(self, object_uri_str, encryption_key):
+    """Strongly consistent check that the correct encryption key is used."""
+    stdout = self.RunGsUtil(['stat', object_uri_str], return_stdout=True)
+    self.assertIn(
+        Base64Sha256FromBase64EncryptionKey(encryption_key), stdout,
+        'Object %s did not use expected encryption key with hash %s. '
+        'Actual object: %s'%
+        (object_uri_str, Base64Sha256FromBase64EncryptionKey(encryption_key),
+         stdout))
+
+  def AssertObjectUnencrypted(self, object_uri_str):
+    stdout = self.RunGsUtil(['stat', object_uri_str], return_stdout=True)
+    self.assertNotIn('Encryption key SHA256', stdout)
+
   def CreateBucket(self, bucket_name=None, test_objects=0, storage_class=None,
                    provider=None, prefer_json_api=False):
     """Creates a test bucket.
@@ -271,7 +275,7 @@ class GsUtilIntegrationTestCase(base.GsUtilTestCase):
     return bucket_uri
 
   def CreateObject(self, bucket_uri=None, object_name=None, contents=None,
-                   prefer_json_api=False):
+                   prefer_json_api=False, encryption_key=None):
     """Creates a test object.
 
     Args:
@@ -283,26 +287,32 @@ class GsUtilIntegrationTestCase(base.GsUtilTestCase):
                 is not written to, which means that it isn't actually created
                 yet on the server.
       prefer_json_api: If true, use the JSON creation functions where possible.
+      encryption_key: AES256 encryption key to use when creating the object,
+          if any.
 
     Returns:
       A StorageUri for the created object.
     """
     bucket_uri = bucket_uri or self.CreateBucket()
 
-    if prefer_json_api and bucket_uri.scheme == 'gs' and contents:
+    if contents and bucket_uri.scheme == 'gs' and (prefer_json_api or
+                                                   encryption_key):
       object_name = object_name or self.MakeTempName('obj')
       json_object = self.CreateObjectJson(contents=contents,
                                           bucket_name=bucket_uri.bucket_name,
-                                          object_name=object_name)
+                                          object_name=object_name,
+                                          encryption_key=encryption_key)
       object_uri = bucket_uri.clone_replace_name(object_name)
       # pylint: disable=protected-access
       # Need to update the StorageUri with the correct values while
       # avoiding creating a versioned string.
+
+      md5 = (Base64ToHexHash(json_object.md5Hash),
+             json_object.md5Hash.strip('\n"\''))
       object_uri._update_from_values(None,
                                      json_object.generation,
                                      True,
-                                     md5=(Base64ToHexHash(json_object.md5Hash),
-                                          json_object.md5Hash.strip('\n"\'')))
+                                     md5=md5)
       # pylint: enable=protected-access
       return object_uri
 
@@ -350,7 +360,8 @@ class GsUtilIntegrationTestCase(base.GsUtilTestCase):
                             contents='test %d' % i)
     return bucket
 
-  def CreateObjectJson(self, contents, bucket_name=None, object_name=None):
+  def CreateObjectJson(self, contents, bucket_name=None, object_name=None,
+                       encryption_key=None):
     """Creates a test object (GCS provider only) using the JSON API.
 
     Args:
@@ -359,6 +370,8 @@ class GsUtilIntegrationTestCase(base.GsUtilTestCase):
                    specified, a new temporary bucket is created.
       object_name: The name to use for the object. If not specified, a temporary
                    test object name is constructed.
+      encryption_key: AES256 encryption key to use when creating the object,
+          if any.
 
     Returns:
       An apitools Object for the created object.
@@ -369,8 +382,12 @@ class GsUtilIntegrationTestCase(base.GsUtilTestCase):
         name=object_name,
         bucket=bucket_name,
         contentType='application/octet-stream')
+    encryption_tuple = None
+    if encryption_key:
+      encryption_tuple = CryptoTuple(encryption_key)
     return self.json_api.UploadObject(cStringIO.StringIO(contents),
-                                      object_metadata, provider='gs')
+                                      object_metadata, provider='gs',
+                                      encryption_tuple=encryption_tuple)
 
   def RunGsUtil(self, cmd, return_status=False, return_stdout=False,
                 return_stderr=False, expected_status=0, stdin=None):
@@ -463,9 +480,27 @@ class GsUtilIntegrationTestCase(base.GsUtilTestCase):
 
   @contextmanager
   def SetAnonymousBotoCreds(self):
-    boto_config_path = self.CreateTempFile(
-        contents=BOTO_CONFIG_CONTENTS_IGNORE_ANON_WARNING)
-    with SetBotoConfigFileForTest(boto_config_path):
+    # Tell gsutil not to override the real error message with a warning about
+    # anonymous access if no credentials are provided in the config file.
+    boto_config_for_test = [
+        ('Tests', 'bypass_anonymous_access_warning', 'True')]
+
+    # Also, maintain any custom host/port/API configuration, since we'll need
+    # to contact the same host when operating in a development environment.
+    for creds_config_key in (
+        'gs_host', 'gs_json_host', 'gs_post', 'gs_json_port'):
+      boto_config_for_test.append(
+          ('Credentials', creds_config_key,
+           boto.config.get('Credentials', creds_config_key, None)))
+    boto_config_for_test.append(
+        ('Boto', 'https_validate_certificates',
+         boto.config.get('Boto', 'https_validate_certificates', None)))
+    for api_config_key in ('json_api_version', 'prefer_api'):
+      boto_config_for_test.append(
+          ('GSUtil', api_config_key,
+           boto.config.get('GSUtil', api_config_key, None)))
+
+    with SetBotoConfigForTest(boto_config_for_test, use_existing_config=False):
       # Make sure to reset Developer Shell credential port so that the child
       # gsutil process is really anonymous.
       with SetEnvironmentForTest({'DEVSHELL_CLIENT_PORT': None}):

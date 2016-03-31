@@ -27,7 +27,7 @@ class CloudApi(object):
   """
 
   def __init__(self, bucket_storage_uri_class, logger, provider=None,
-               debug=0, trace_token=None):
+               debug=0, trace_token=None, perf_trace_token=None):
     """Performs necessary setup for interacting with the cloud storage provider.
 
     Args:
@@ -39,12 +39,14 @@ class CloudApi(object):
       debug: Debug level for the API implementation (0..3).
       trace_token: Google internal trace token to pass to the API
                    implementation (string).
+      perf_trace_token: Performance trace token to use when making API calls.
     """
     self.bucket_storage_uri_class = bucket_storage_uri_class
     self.logger = logger
     self.provider = provider
     self.debug = debug
     self.trace_token = trace_token
+    self.perf_trace_token = perf_trace_token
 
   def GetBucket(self, bucket_name, provider=None, fields=None):
     """Gets Bucket metadata.
@@ -206,6 +208,10 @@ class CloudApi(object):
                         provider=None, fields=None):
     """Gets object metadata.
 
+    If decryption is supported by the implementing class, this function will
+    read decryption keys from configuration and appropriately retry requests to
+    encrypted objects with the correct key.
+
     Args:
       bucket_name: Bucket containing the object.
       object_name: Object name.
@@ -256,9 +262,11 @@ class CloudApi(object):
 
   def GetObjectMedia(self, bucket_name, object_name, download_stream,
                      provider=None, generation=None, object_size=None,
+                     compressed_encoding=False,
                      download_strategy=DownloadStrategy.ONE_SHOT, start_byte=0,
                      end_byte=None, progress_callback=None,
-                     serialization_data=None, digesters=None):
+                     serialization_data=None, digesters=None,
+                     decryption_tuple=None):
     """Gets object data.
 
     Args:
@@ -269,6 +277,7 @@ class CloudApi(object):
                 class-wide default is used.
       generation: Generation of the object to retrieve.
       object_size: Total size of the object being downloaded.
+      compressed_encoding: If true, object is stored with a compressed encoding.
       download_strategy: Cloud API download strategy to use for download.
       start_byte: Starting point for download (for resumable downloads and
                   range requests). Can be set to negative to request a range
@@ -285,6 +294,8 @@ class CloudApi(object):
                  update(bytes) and digest() using that algorithm.
                  Implementation can set the digester value to None to indicate
                  bytes were not successfully digested on-the-fly.
+      decryption_tuple: Optional CryptoTuple for decrypting an encrypted
+          object.
 
     Raises:
       ArgumentException for errors during input validation.
@@ -298,7 +309,7 @@ class CloudApi(object):
 
   def UploadObject(self, upload_stream, object_metadata, canned_acl=None,
                    size=None, preconditions=None, progress_callback=None,
-                   provider=None, fields=None):
+                   encryption_tuple=None, provider=None, fields=None):
     """Uploads object data and metadata.
 
     Args:
@@ -312,6 +323,8 @@ class CloudApi(object):
       progress_callback: Optional callback function for progress notifications.
                          Receives calls with arguments
                          (bytes_transferred, total_size).
+      encryption_tuple: Optional CryptoTuple for encrypting the uploaded
+          object.
       provider: Cloud storage provider to connect to.  If not present,
                 class-wide default is used.
       fields: If present, return only these Object metadata fields.
@@ -327,8 +340,8 @@ class CloudApi(object):
 
   def UploadObjectStreaming(self, upload_stream, object_metadata,
                             canned_acl=None, preconditions=None,
-                            progress_callback=None, provider=None,
-                            fields=None):
+                            progress_callback=None, encryption_tuple=None,
+                            provider=None, fields=None):
     """Uploads object data and metadata.
 
     Args:
@@ -342,6 +355,8 @@ class CloudApi(object):
                          Receives calls with arguments
                          (bytes_transferred, total_size), but fills in only
                          bytes_transferred.
+      encryption_tuple: Optional CryptoTuple for encrypting the uploaded
+          object.
       provider: Cloud storage provider to connect to.  If not present,
                 class-wide default is used.
       fields: If present, return only these Object metadata fields.
@@ -358,8 +373,8 @@ class CloudApi(object):
   def UploadObjectResumable(
       self, upload_stream, object_metadata, canned_acl=None,
       size=None, preconditions=None, serialization_data=None,
-      tracker_callback=None, progress_callback=None, provider=None,
-      fields=None):
+      tracker_callback=None, progress_callback=None, encryption_tuple=None,
+      provider=None, fields=None):
     """Uploads object data and metadata using a resumable upload strategy.
 
     Args:
@@ -380,6 +395,8 @@ class CloudApi(object):
       progress_callback: Optional callback function for progress notifications.
                          Receives calls with arguments
                          (bytes_transferred, total_size).
+      encryption_tuple: Optional CryptoTuple for encrypting the uploaded
+          object.
       provider: Cloud storage provider to connect to.  If not present,
                 class-wide default is used.
       fields: If present, return only these Object metadata fields when the
@@ -396,7 +413,8 @@ class CloudApi(object):
 
   def CopyObject(self, src_obj_metadata, dst_obj_metadata, src_generation=None,
                  canned_acl=None, preconditions=None, progress_callback=None,
-                 max_bytes_per_call=None, provider=None, fields=None):
+                 max_bytes_per_call=None, encryption_tuple=None,
+                 decryption_tuple=None, provider=None, fields=None):
     """Copies an object in the cloud.
 
     Args:
@@ -413,6 +431,11 @@ class CloudApi(object):
                          (bytes_transferred, total_size).
       max_bytes_per_call: Integer describing maximum number of bytes
                           to rewrite per service call.
+      encryption_tuple: Optional CryptoTuple for encrypting the destination
+          object.
+      decryption_tuple: Optional CryptoTuple for decrypting the source
+          object. If supplied without encryption_tuple, destination object will
+          be written without customer-supplied encryption.
       provider: Cloud storage provider to connect to.  If not present,
                 class-wide default is used.
       fields: If present, return only these Object metadata fields.
@@ -427,7 +450,8 @@ class CloudApi(object):
     raise NotImplementedError('CopyObject must be overloaded')
 
   def ComposeObject(self, src_objs_metadata, dst_obj_metadata,
-                    preconditions=None, provider=None, fields=None):
+                    preconditions=None, encryption_tuple=None,
+                    provider=None, fields=None):
     """Composes an object in the cloud.
 
     Args:
@@ -436,6 +460,8 @@ class CloudApi(object):
       dst_obj_metadata: Metadata for the destination object including bucket
                         and object name.
       preconditions: Destination object preconditions for the request.
+      encryption_tuple: Optional CryptoTuple for decrypting source objects
+          and encrypting the destination object.
       provider: Cloud storage provider to connect to.  If not present,
                 class-wide default is used.
       fields: If present, return only these Object metadata fields.
@@ -512,6 +538,19 @@ class CloudApi(object):
     raise NotImplementedError('StopChannel must be overloaded')
 
 
+class CryptoTuple(object):
+  """Class describing an encryption/decryption key for cloud API requests."""
+
+  def __init__(self, crypto_key):
+    """Initialize the CryptoTuple.
+
+    Args:
+      crypto_key: Base64-encoded string of encryption key.
+    """
+    self.crypto_key = crypto_key
+    self.crypto_alg = 'AES256'  # Only currently supported encryption algorithm.
+
+
 class Preconditions(object):
   """Preconditions class for specifying preconditions to cloud API requests."""
 
@@ -526,6 +565,10 @@ class Preconditions(object):
     """
     self.gen_match = gen_match
     self.meta_gen_match = meta_gen_match
+
+
+class EncryptionException(Exception):
+  """Exception raised when an encrypted resource cannot be decrypted."""
 
 
 class ArgumentException(Exception):
